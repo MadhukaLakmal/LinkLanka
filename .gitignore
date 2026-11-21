@@ -1,0 +1,75 @@
+## Dependencies
+node_modules/
+apps/**/node_modules/
+packages/**/node_modules/
+
+## Package manager artifacts
+.pnp/
+.pnp.js
+package-lock.json
+
+## Build outputs
+dist/
+build/
+coverage/
+.next/
+out/
+*.tsbuildinfo
+.cache/
+.parcel-cache/
+.turbo/
+next-env.d.ts
+
+## API runtime artifacts
+apps/api/dist/
+apps/api/uploads/
+apps/api/audios/
+
+## Android build artifacts
+apps/mobile/android/build/
+apps/mobile/android/app/build/
+apps/mobile/android/app/.cxx/
+apps/mobile/android/.gradle/
+apps/mobile/android/.kotlin/
+
+## React Native local artifacts
+/android/
+/ios/
+.expo/
+*.keystore
+
+## Environment files
+.env
+.env.local
+.env.*.local
+.env.secrets
+.env.home
+apps/**/.env
+apps/mobile/.env.home
+
+## Firebase / credentials
+**/google-services.json
+**/GoogleService-Info.plist
+**/service-account*.json
+**/serviceAccount*.json
+**/firebase-adminsdk*.json
+**/*credentials*.json
+
+## Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+## Editor / OS / Agent Tools
+.DS_Store
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+.sisyphus/
+.opencode/
+

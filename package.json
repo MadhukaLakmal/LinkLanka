@@ -1,0 +1,16 @@
+{
+  "name": "LinkLankaV2",
+  "version": "1.0.0",
+  "private": true,
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "install:api": "cd apps/api && bun install",
+    "install:mobile": "cd apps/mobile && bun install"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "bun@1.3.11"
+}

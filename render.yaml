@@ -1,0 +1,53 @@
+services:
+  - type: web
+    name: linklanka-api-demo
+    runtime: node
+    plan: free
+    rootDir: apps/api
+    buildCommand: curl -fsSL https://bun.sh/install | bash && export BUN_INSTALL=$HOME/.bun && export PATH=$BUN_INSTALL/bin:$PATH && bun install --frozen-lockfile && bun run build
+    startCommand: node dist/main
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: PORT
+        value: "3000"
+      - key: BASE_URL
+        value: https://linklanka-api-demo.onrender.com
+      - key: GEMINI_TRANSLATION_MODEL
+        value: gemini-3-flash-preview
+      - key: GEMINI_TRANSLATION_FALLBACK_MODEL
+        value: gemini-2.5-flash
+      - key: TRANSLATION_MODEL_MAX_RETRIES
+        value: "1"
+      - key: TRANSLATION_TIMEOUT_MS_TEXT
+        value: "30000"
+      - key: TRANSLATION_TIMEOUT_MS_MEDIA
+        value: "60000"
+      - key: TTS_MANDATORY_ENGLISH_RETRIES
+        value: "1"
+      - key: DOMINANT_LANGUAGE_LOW_CONFIDENCE_THRESHOLD
+        value: "65"
+      - key: JWT_SECRET
+        generateValue: true
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: AWS_S3_BUCKET
+        value: amzn-leo-bucket
+      - key: AWS_S3_REGION
+        value: ap-south-1
+      - key: AWS_S3_PREFIX
+        value: linklanka/
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_SESSION_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_SSL
+        value: "true"
+      - key: DB_SYNCHRONIZE
+        value: "false"
