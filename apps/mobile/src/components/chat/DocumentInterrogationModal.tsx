@@ -1,0 +1,1116 @@
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Dimensions,
+  FlatList,
+  Keyboard,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
+  Pressable,
+  StyleSheet,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { File } from 'expo-file-system';
+import WebView from 'react-native-webview';
+import {
+  askDocumentQuestion,
+  API_BASE_URL,
+  fetchSpreadsheetCsv,
+  type QAChatTurn,
+  type QACitation,
+} from '../../services/api';
+import { useTheme } from '../../contexts/ThemeContext';
+import LanguagePickerModal, {
+  LANGUAGE_OPTIONS,
+  type PreferredLanguage,
+} from './LanguagePickerModal';
+
+// PDF panel occupies ~42 % of the screen; the chat panel takes the rest and
+// shrinks correctly when the soft keyboard opens.
+const PDF_PANEL_HEIGHT = Math.round(Dimensions.get('window').height * 0.42);
+const MAX_DOCUMENT_QUESTION_LENGTH = 2000;
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+interface QAMessage {
+  id: string;
+  role: 'user' | 'ai';
+  text: string;
+  citations?: QACitation[];
+}
+
+interface DocumentInterrogationModalProps {
+  visible: boolean;
+  messageId: string;
+  fileUrl: string;
+  detectedLanguage?:
+    | 'english'
+    | 'singlish'
+    | 'tanglish'
+    | 'mixed'
+    | 'unknown'
+    | null;
+  /** Original filename from the sender's device. */
+  fileName?: string;
+  /** Optional initial page to scroll to (from summary bullet tap). */
+  initialPage?: number;
+  onClose: () => void;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function storageKey(messageId: string): string {
+  return `doc-qa-${messageId}`;
+}
+
+function languageStorageKey(messageId: string): string {
+  return `doc-qa-lang-${messageId}`;
+}
+
+function parsePreferredLanguage(rawValue: string | null): PreferredLanguage | null {
+  return rawValue === 'english' ||
+    rawValue === 'singlish' ||
+    rawValue === 'tanglish'
+    ? rawValue
+    : null;
+}
+
+function resolveDefaultLanguage(
+  detectedLanguage:
+    | 'english'
+    | 'singlish'
+    | 'tanglish'
+    | 'mixed'
+    | 'unknown'
+    | null
+    | undefined,
+): PreferredLanguage {
+  if (
+    detectedLanguage === 'english' ||
+    detectedLanguage === 'singlish' ||
+    detectedLanguage === 'tanglish'
+  ) {
+    return detectedLanguage;
+  }
+
+  return 'english';
+}
+
+function generateId(): string {
+  return 'xxxxxxxx'.replace(/[x]/g, () =>
+    ((Math.random() * 16) | 0).toString(16),
+  );
+}
+
+function extractFilename(url: string): string {
+  const cleanUrl = url.split('?')[0];
+  const segments = cleanUrl.split('/');
+  const raw = segments[segments.length - 1] ?? 'Document';
+  if (raw.length > 40) {
+    const ext = raw.split('.').pop() ?? '';
+    return `Document.${ext}`;
+  }
+  return raw;
+}
+
+/** Get lowercase file extension from URL (e.g. ".xlsx" → "xlsx"). */
+function getFileExtension(url: string): string {
+  const segments = url.split('/').pop() ?? '';
+  const ext = segments.split('?')[0].split('.').pop() ?? '';
+  return ext.toLowerCase();
+}
+
+/** Check whether the URL points to an Excel / spreadsheet file. */
+function isSpreadsheetFile(url: string): boolean {
+  const ext = getFileExtension(url);
+  return ext === 'xlsx' || ext === 'xls';
+}
+
+function extractOrigin(url: string): string {
+  // e.g. "http://192.168.1.5:3000/media/uploads/doc.pdf" → "http://192.168.1.5:3000"
+  const match = url.match(/^(https?:\/\/[^/]+)/);
+  return match ? match[1] : '';
+}
+
+function isFileUri(url: string): boolean {
+  return /^file:\/\//i.test(url.trim());
+}
+
+function isHttpUrl(url: string): boolean {
+  return /^https?:\/\//i.test(url.trim());
+}
+
+async function hasReadableLocalFile(fileUri: string): Promise<boolean> {
+  try {
+    const file = new File(fileUri);
+    if (!file.exists) {
+      return false;
+    }
+
+    const info = file.info();
+    return info.exists && (info.size ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Rewrite the origin of a stored file URL to match the currently-configured
+ * API base URL. Handles cases where the URL was stored with a different IP
+ * (e.g. localhost, old network IP) than the device can currently reach.
+ */
+function normalizeFileUrl(url: string): string {
+  const storedOrigin = extractOrigin(url);
+  const currentOrigin = extractOrigin(API_BASE_URL);
+  if (!storedOrigin || !currentOrigin || storedOrigin === currentOrigin) {
+    return url;
+  }
+
+  const isLocalOrigin = /^(https?:\/\/)?(localhost|127\.0\.0\.1)(:\d+)?$/i.test(
+    storedOrigin,
+  );
+
+  if (!isLocalOrigin) {
+    return url;
+  }
+
+  return url.replace(storedOrigin, currentOrigin);
+}
+
+// ── Spreadsheet WebView HTML builder ──────────────────────────────────────────
+function buildSpreadsheetViewerHtml(csv: string, sheetNames: string[]): string {
+  const escapedCsv = JSON.stringify(csv);
+  const escapedNames = JSON.stringify(sheetNames);
+
+  return `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=3,user-scalable=yes">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,sans-serif;background:#f3f4f6;color:#1f2937}
+#tabs{display:flex;overflow-x:auto;background:#fff;border-bottom:2px solid #e5e7eb;position:sticky;top:0;z-index:10;-webkit-overflow-scrolling:touch}
+.tab{padding:10px 16px;font-size:13px;font-weight:500;color:#6b7280;border:none;background:none;cursor:pointer;white-space:nowrap;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s}
+.tab.active{color:#2563eb;border-bottom-color:#2563eb}
+#container{padding:8px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+#container table{border-collapse:collapse;font-size:13px;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1);min-width:100%}
+#container td,#container th{padding:8px 12px;border:1px solid #e5e7eb;white-space:nowrap;max-width:300px;overflow:hidden;text-overflow:ellipsis}
+#container th{background:#f9fafb;font-weight:600;color:#374151;text-align:left;position:sticky;top:0}
+#container tr:nth-child(even){background:#f9fafb}
+#loading{display:flex;align-items:center;justify-content:center;height:100vh;color:#6b7280;font-size:14px;flex-direction:column;gap:8px}
+</style></head><body>
+<div id="tabs"></div>
+<div id="container"><div id="loading">Rendering spreadsheet\u2026</div></div>
+<script>
+(function(){
+var CSV=${escapedCsv};
+var SHEET_NAMES=${escapedNames};
+var sheets=parseSheets(CSV,SHEET_NAMES);
+
+function parseSheets(csv,names){
+  var result={};
+  var currentName=names[0]||'Sheet1';
+  result[currentName]='';
+  var lines=csv.split('\\n');
+  for(var i=0;i<lines.length;i++){
+    if(lines[i].startsWith('## Sheet: ')){
+      currentName=lines[i].replace('## Sheet: ','');
+      result[currentName]='';
+    }else{
+      result[currentName]+=(result[currentName]?'\\n':'')+lines[i];
+    }
+  }
+  return result;
+}
+
+function renderSheet(name){
+  var rows=sheets[name];
+  if(!rows){document.getElementById('container').innerHTML='<table><tr><td>No data</td></tr></table>';return}
+  var lines=rows.split('\\n').filter(function(l){return l.trim()});
+  if(!lines.length){document.getElementById('container').innerHTML='<table><tr><td>Empty sheet</td></tr></table>';return}
+  var table='<table><thead><tr>';
+  var headers=parseCSVLine(lines[0]);
+  for(var h=0;h<headers.length;h++)table+='<th>'+escHtml(headers[h])+'</th>';
+  table+='</tr></thead><tbody>';
+  for(var r=1;r<lines.length;r++){
+    var cols=parseCSVLine(lines[r]);
+    table+='<tr>';
+    for(var c=0;c<Math.max(cols.length,headers.length);c++)table+='<td>'+(c<cols.length?escHtml(cols[c]):'')+'</td>';
+    table+='</tr>';
+  }
+  table+='</tbody></table>';
+  document.getElementById('container').innerHTML=table;
+}
+
+function parseCSVLine(line){
+  var result=[],current='',inQuote=false;
+  for(var i=0;i<line.length;i++){
+    var ch=line[i];
+    if(inQuote){if(ch==='"'){if(i+1<line.length&&line[i+1]==='"'){current+='"';i++}else{inQuote=false}}else{current+=ch}}
+    else if(ch==='"'){inQuote=true}
+    else if(ch===','){result.push(current);current=''}
+    else{current+=ch}
+  }
+  result.push(current);
+  return result;
+}
+
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+
+// Render tabs
+var names=Object.keys(sheets);
+var tabsEl=document.getElementById('tabs');
+if(names.length>1){
+  names.forEach(function(name,i){
+    var btn=document.createElement('button');
+    btn.className='tab'+(i===0?' active':'');
+    btn.textContent=name;
+    btn.onclick=function(){renderSheet(name);
+      document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
+      btn.classList.add('active');
+    };
+    tabsEl.appendChild(btn);
+  });
+}else{
+  tabsEl.style.display='none';
+}
+renderSheet(names[0]);
+})();
+<\/script></body></html>`;
+}
+
+// ── PDF.js WebView HTML builder ──────────────────────────────────────────────
+function buildPdfViewerHtml(pdfUrl: string): string {
+  const safeUrl = pdfUrl.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+
+  return `<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=3,user-scalable=yes">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{background:#f3f4f6}
+#c{width:100%;height:100vh;overflow-y:scroll;scroll-snap-type:y mandatory;-webkit-overflow-scrolling:touch}
+.pw{width:100%;min-height:100vh;scroll-snap-align:start;display:flex;align-items:center;justify-content:center;background:#f3f4f6;padding:2px 0}
+canvas{display:block;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.15)}
+#ld{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font-family:system-ui,sans-serif;color:#6b7280;font-size:14px}
+</style></head><body>
+<div id="c"></div><div id="ld">Loading document\u2026</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"><\/script>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+var cur=1,els=[];
+async function run(){try{
+var pdf=await pdfjsLib.getDocument('${safeUrl}').promise;
+document.getElementById('ld').style.display='none';
+var ct=document.getElementById('c');
+window.ReactNativeWebView.postMessage(JSON.stringify({type:'loaded',pages:pdf.numPages}));
+for(var i=1;i<=pdf.numPages;i++){var pg=await pdf.getPage(i);
+var uv=pg.getViewport({scale:1});var s=window.innerWidth/uv.width;var rs=s*(window.devicePixelRatio||2);var vp=pg.getViewport({scale:rs});
+var w=document.createElement('div');w.className='pw';w.id='p'+i;w.dataset.pg=String(i);
+var cv=document.createElement('canvas');cv.width=vp.width;cv.height=vp.height;
+cv.style.width=window.innerWidth+'px';cv.style.height=Math.round(uv.height*s)+'px';
+w.appendChild(cv);ct.appendChild(w);els.push(w);
+await pg.render({canvasContext:cv.getContext('2d'),viewport:vp}).promise;}
+var ob=new IntersectionObserver(function(en){var b=0,bp=cur;
+for(var j=0;j<en.length;j++){if(en[j].intersectionRatio>b){b=en[j].intersectionRatio;bp=+(en[j].target.dataset.pg)}}
+if(bp!==cur&&b>.3){cur=bp;window.ReactNativeWebView.postMessage(JSON.stringify({type:'page',page:cur}))}}
+,{root:ct,threshold:[.3,.5,.7]});
+for(var k=0;k<els.length;k++)ob.observe(els[k]);
+}catch(e){window.ReactNativeWebView.postMessage(JSON.stringify({type:'error',msg:e.message||'PDF load failed'}))}}
+window.goToPage=function(p){var el=document.getElementById('p'+p);if(el)el.scrollIntoView({behavior:'smooth',block:'start'})};
+run();
+<\/script></body></html>`;
+}
+
+// ── Component ────────────────────────────────────────────────────────────────
+
+export default function DocumentInterrogationModal({
+  visible,
+  messageId,
+  fileUrl,
+  detectedLanguage,
+  initialPage,
+  fileName,
+  onClose,
+}: DocumentInterrogationModalProps) {
+  const insets = useSafeAreaInsets();
+  const webViewRef = useRef<WebView>(null);
+  const flatListRef = useRef<FlatList<QAMessage>>(null);
+  const initialPageRef = useRef(initialPage);
+  const [qaMessages, setQaMessages] = useState<QAMessage[]>([]);
+  const [inputText, setInputText] = useState('');
+  const [isAsking, setIsAsking] = useState(false);
+  const [androidKeyboardOffset, setAndroidKeyboardOffset] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(0);
+  const [pdfError, setPdfError] = useState(false);
+  const [pdfErrorMessage, setPdfErrorMessage] = useState<string | null>(null);
+  const [selectedLanguage, setSelectedLanguage] = useState<PreferredLanguage>(
+    () => resolveDefaultLanguage(detectedLanguage),
+  );
+  const [isLanguagePickerOpen, setIsLanguagePickerOpen] = useState(false);
+  const [resolvedFileUrl, setResolvedFileUrl] = useState(() =>
+    normalizeFileUrl(fileUrl),
+  );
+  const [csvData, setCsvData] = useState<string | null>(null);
+  const [csvSheetNames, setCsvSheetNames] = useState<string[]>([]);
+  const [csvLoading, setCsvLoading] = useState(false);
+  const { colors } = useTheme();
+
+  // ── Fetch CSV for spreadsheets ──────────────────────────────────────────
+  useEffect(() => {
+    if (!visible || !messageId || !isSpreadsheetFile(resolvedFileUrl)) {
+      return;
+    }
+
+    let cancelled = false;
+    setCsvLoading(true);
+
+    fetchSpreadsheetCsv(messageId)
+      .then((result) => {
+        if (!cancelled) {
+          setCsvData(result.csv);
+          setCsvSheetNames(result.sheetNames);
+          setCsvLoading(false);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPdfError(true);
+          setPdfErrorMessage(
+            'Failed to load spreadsheet data. The file may be too large or inaccessible.',
+          );
+          setCsvLoading(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, messageId, resolvedFileUrl]);
+
+  // ── Reset state when modal opens ───────────────────────────────────────
+  useEffect(() => {
+    if (visible) {
+      setPdfError(false);
+      setPdfErrorMessage(null);
+      setIsLanguagePickerOpen(false);
+      setCurrentPage(1);
+      setTotalPages(0);
+      setAndroidKeyboardOffset(0);
+    }
+  }, [visible]);
+
+  useEffect(() => {
+    if (!visible || !messageId) {
+      return;
+    }
+
+    const fallbackLanguage = resolveDefaultLanguage(detectedLanguage);
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const stored = await AsyncStorage.getItem(languageStorageKey(messageId));
+        if (cancelled) {
+          return;
+        }
+
+        const parsed = parsePreferredLanguage(stored);
+        setSelectedLanguage(parsed ?? fallbackLanguage);
+      } catch {
+        if (!cancelled) {
+          setSelectedLanguage(fallbackLanguage);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [visible, messageId, detectedLanguage]);
+
+  const handleSelectLanguage = useCallback(
+    (language: PreferredLanguage) => {
+      setSelectedLanguage(language);
+      setIsLanguagePickerOpen(false);
+
+      if (!messageId) {
+        return;
+      }
+
+      AsyncStorage.setItem(languageStorageKey(messageId), language).catch(
+        () => {},
+      );
+    },
+    [messageId],
+  );
+
+  useEffect(() => {
+    if (Platform.OS !== 'android' || !visible) return;
+
+    const showSub = Keyboard.addListener('keyboardDidShow', (event) => {
+      const keyboardHeight = event.endCoordinates?.height ?? 0;
+      setAndroidKeyboardOffset(Math.max(0, keyboardHeight));
+    });
+
+    const hideSub = Keyboard.addListener('keyboardDidHide', () => {
+      setAndroidKeyboardOffset(0);
+    });
+
+    return () => {
+      setAndroidKeyboardOffset(0);
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [visible]);
+
+  useEffect(() => {
+    const normalized = normalizeFileUrl(fileUrl);
+    setResolvedFileUrl(normalized);
+    setPdfError(false);
+    setPdfErrorMessage(null);
+
+    if (!visible) return;
+
+    let cancelled = false;
+
+    (async () => {
+      if (cancelled) {
+        return;
+      }
+
+      if (isFileUri(normalized)) {
+        const readable = await hasReadableLocalFile(normalized);
+        if (!readable) {
+          setPdfError(true);
+          setPdfErrorMessage(
+            'This local document file is no longer available. Please resend the document.',
+          );
+          return;
+        }
+
+        setResolvedFileUrl(normalized);
+        return;
+      }
+
+      if (!isHttpUrl(normalized)) {
+        setPdfError(true);
+        setPdfErrorMessage('Invalid document URL for preview.');
+        return;
+      }
+
+      setResolvedFileUrl(normalized);
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [fileUrl, visible]);
+
+  // ── Persist / Restore Q&A history ──────────────────────────────────────
+  useEffect(() => {
+    if (!visible || !messageId) return;
+    AsyncStorage.getItem(storageKey(messageId)).then((raw) => {
+      if (raw) {
+        try {
+          setQaMessages(JSON.parse(raw));
+        } catch {
+          // corrupted data — ignore
+        }
+      }
+    });
+  }, [visible, messageId]);
+
+  const persistHistory = useCallback(
+    (messages: QAMessage[]) => {
+      AsyncStorage.setItem(storageKey(messageId), JSON.stringify(messages)).catch(
+        () => {},
+      );
+    },
+    [messageId],
+  );
+
+  // Keep initial page ref in sync for onMessage handler
+  useEffect(() => {
+    initialPageRef.current = initialPage;
+  }, [initialPage]);
+
+  // ── Ask question ───────────────────────────────────────────────────────
+  const handleSend = useCallback(async () => {
+    const question = inputText.trim();
+    if (!question || isAsking) return;
+    if (question.length > MAX_DOCUMENT_QUESTION_LENGTH) return;
+
+    const userMsg: QAMessage = {
+      id: generateId(),
+      role: 'user',
+      text: question,
+    };
+
+    const nextMessages = [...qaMessages, userMsg];
+    setQaMessages(nextMessages);
+    setInputText('');
+
+    // Build chat history for the API (exclude the current question)
+    const chatHistory: QAChatTurn[] = qaMessages.map((m) => ({
+      role: m.role,
+      text: m.text,
+    }));
+
+    setIsAsking(true);
+    try {
+      const response = await askDocumentQuestion(
+        messageId,
+        question,
+        chatHistory,
+        selectedLanguage,
+      );
+
+      const aiMsg: QAMessage = {
+        id: generateId(),
+        role: 'ai',
+        text: response.answer,
+        citations: response.citations,
+      };
+
+      const updated = [...nextMessages, aiMsg];
+      setQaMessages(updated);
+      persistHistory(updated);
+      // onContentSizeChange on the FlatList handles scrolling to bottom
+    } catch {
+      const errorMsg: QAMessage = {
+        id: generateId(),
+        role: 'ai',
+        text: 'Sorry, I couldn\'t process your question. Please try again.',
+      };
+      const updated = [...nextMessages, errorMsg];
+      setQaMessages(updated);
+      persistHistory(updated);
+    } finally {
+      setIsAsking(false);
+    }
+  }, [
+    inputText,
+    isAsking,
+    qaMessages,
+    messageId,
+    persistHistory,
+    selectedLanguage,
+  ]);
+
+  // ── Navigate to page (from citation tap — via WebView) ─────────────────
+  const goToPage = useCallback((page: number) => {
+    webViewRef.current?.injectJavaScript(`window.goToPage(${page}); true;`);
+  }, []);
+
+  // ── Handle messages from PDF.js WebView ─────────────────────────────────
+  const handleWebViewMessage = useCallback(
+    (event: { nativeEvent: { data: string } }) => {
+      try {
+        const data = JSON.parse(event.nativeEvent.data);
+        switch (data.type) {
+          case 'loaded':
+            setTotalPages(data.pages);
+            if (initialPageRef.current && initialPageRef.current > 1) {
+              setTimeout(() => {
+                webViewRef.current?.injectJavaScript(
+                  `window.goToPage(${initialPageRef.current}); true;`,
+                );
+              }, 400);
+            }
+            break;
+          case 'page':
+            setCurrentPage(data.page);
+            break;
+          case 'error':
+            console.warn('[DocInterrogation] PDF.js warning:', data.msg);
+            setPdfErrorMessage(
+              typeof data.msg === 'string' && data.msg.trim().length > 0
+                ? data.msg
+                : 'Unable to render document preview',
+            );
+            setPdfError(true);
+            break;
+        }
+      } catch {
+        // ignore malformed messages
+      }
+    },
+    [],
+  );
+
+  // ── Handle close: persist and reset ────────────────────────────────────
+  const handleClose = useCallback(() => {
+    persistHistory(qaMessages);
+    onClose();
+  }, [qaMessages, persistHistory, onClose]);
+
+  // ── Render Q&A message ─────────────────────────────────────────────────
+  const renderQAMessage = useCallback(
+    ({ item }: { item: QAMessage }) => {
+      const isUser = item.role === 'user';
+      return (
+        <View
+          style={[
+            styles.qaBubble,
+            isUser
+              ? [styles.qaBubbleUser, { backgroundColor: colors.primary }]
+              : [styles.qaBubbleAi, { backgroundColor: colors.surfaceElevated, borderColor: colors.border }],
+          ]}
+        >
+          {!isUser && (
+            <View style={styles.aiLabel}>
+              <Text style={[styles.aiLabelText, { color: colors.primary }]}>✨ AI</Text>
+            </View>
+          )}
+          <Text
+            style={[
+              styles.qaText,
+              isUser ? styles.qaTextUser : [styles.qaTextAi, { color: colors.text }],
+            ]}
+          >
+            {item.text}
+          </Text>
+          {item.citations && item.citations.length > 0 && (
+            <View style={styles.citationsContainer}>
+              {item.citations.map((cit, idx) => (
+                <Pressable
+                  key={idx}
+                  onPress={() => goToPage(cit.page)}
+                  style={({ pressed }) => [
+                    styles.citationChip,
+                    { backgroundColor: colors.primaryFaded },
+                    pressed && styles.citationChipPressed,
+                  ]}
+                >
+                  <Ionicons name="document-text-outline" size={12} color={colors.primary} />
+                  <Text style={[styles.citationPage, { color: colors.primary }]}>p. {cit.page}</Text>
+                  <Text style={[styles.citationExcerpt, { color: colors.textSecondary }]} numberOfLines={1}>
+                    {cit.excerpt}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+        </View>
+      );
+    },
+    [goToPage, colors],
+  );
+
+  const displayFilename = fileName ?? extractFilename(resolvedFileUrl);
+  const selectedLanguageLabel =
+    LANGUAGE_OPTIONS.find((option) => option.key === selectedLanguage)?.label ??
+    'English';
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      presentationStyle="fullScreen"
+      onRequestClose={handleClose}
+    >
+      <KeyboardAvoidingView
+        style={[styles.root, { paddingTop: insets.top, backgroundColor: colors.background }]}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : undefined}
+      >
+        {/* ── Header ── */}
+        <View style={[styles.header, { borderBottomColor: colors.border }]}>
+          <Pressable onPress={handleClose} hitSlop={12} style={styles.closeBtn}>
+            <Ionicons name="close" size={24} color={colors.text} />
+          </Pressable>
+          <View style={styles.headerTitleContainer}>
+            <Ionicons name="document-text" size={18} color={colors.primary} />
+            <Text style={[styles.headerTitle, { color: colors.text }]} numberOfLines={1}>
+              {displayFilename}
+            </Text>
+          </View>
+          <View style={styles.headerRight}>
+            <Pressable
+              onPress={() => setIsLanguagePickerOpen(true)}
+              style={[styles.languageBtn, { backgroundColor: colors.primaryFaded }]}
+            >
+              <Text style={[styles.languageBtnText, { color: colors.primary }]}>
+                {selectedLanguageLabel}
+              </Text>
+              <Ionicons name="chevron-down" size={14} color={colors.primary} />
+            </Pressable>
+            {totalPages > 0 && (
+              <Text style={[styles.pageIndicator, { color: colors.textSecondary }]}> 
+                {currentPage}/{totalPages}
+              </Text>
+            )}
+          </View>
+        </View>
+
+        {/* ── Top half: Document viewer ── */}
+        <View style={[styles.docViewer, { backgroundColor: colors.surface }]}>
+          {isSpreadsheetFile(resolvedFileUrl) ? (
+            csvLoading ? (
+              <View style={styles.spreadsheetLoading}>
+                <ActivityIndicator size="large" color={colors.spinnerColor} />
+                <Text style={[styles.spreadsheetHint, { color: colors.textSecondary }]}>
+                  Loading spreadsheet data…
+                </Text>
+              </View>
+            ) : csvData != null ? (
+              <WebView
+                ref={webViewRef}
+                source={{ html: buildSpreadsheetViewerHtml(csvData, csvSheetNames) }}
+                originWhitelist={['*']}
+                javaScriptEnabled
+                mixedContentMode="always"
+                onMessage={handleWebViewMessage}
+                style={styles.pdf}
+              />
+            ) : (
+              <View style={styles.pdfErrorContainer}>
+                <Ionicons name="alert-circle-outline" size={48} color={colors.emptyIcon} />
+                <Text style={[styles.pdfErrorText, { color: colors.emptyText }]}>
+                  {pdfErrorMessage ?? 'Unable to render document preview'}
+                </Text>
+              </View>
+            )
+          ) : pdfError ? (
+            <View style={styles.pdfErrorContainer}>
+              <Ionicons name="alert-circle-outline" size={48} color={colors.emptyIcon} />
+              <Text style={[styles.pdfErrorText, { color: colors.emptyText }]}>
+                {pdfErrorMessage ?? 'Unable to render document preview'}
+              </Text>
+            </View>
+          ) : (
+            <WebView
+              ref={webViewRef}
+              source={{ html: buildPdfViewerHtml(resolvedFileUrl), baseUrl: extractOrigin(resolvedFileUrl) }}
+              originWhitelist={['*']}
+              javaScriptEnabled
+              mixedContentMode="always"
+              allowFileAccess
+              allowUniversalAccessFromFileURLs
+              onMessage={handleWebViewMessage}
+              onError={() => setPdfError(true)}
+              style={styles.pdf}
+            />
+          )}
+        </View>
+
+        {/* ── Divider ── */}
+        <View style={[styles.divider, { backgroundColor: colors.divider }]} />
+
+        {/* ── Bottom half: Private AI chat ── */}
+        <View style={[styles.chatContainer, { backgroundColor: colors.surface }]}>
+          {qaMessages.length === 0 ? (
+            <View style={styles.emptyChat}>
+              <Text style={styles.emptyChatIcon}>🤖</Text>
+              <Text style={[styles.emptyChatTitle, { color: colors.text }]}>Document Assistant</Text>
+              <Text style={[styles.emptyChatSubtitle, { color: colors.textSecondary }]}>
+                Ask any question about this document.{'\n'}
+                Tap citation chips to jump to the source.
+              </Text>
+            </View>
+          ) : (
+            <FlatList
+              ref={flatListRef}
+              data={qaMessages}
+              keyExtractor={(item) => item.id}
+              renderItem={renderQAMessage}
+              contentContainerStyle={styles.chatList}
+              removeClippedSubviews
+              initialNumToRender={10}
+              windowSize={5}
+              onContentSizeChange={() =>
+                flatListRef.current?.scrollToEnd({ animated: true })
+              }
+            />
+          )}
+
+          {/* ── Loading indicator ── */}
+          {isAsking && (
+            <View style={styles.loadingRow}>
+              <ActivityIndicator size="small" color={colors.spinnerColor} />
+              <Text style={[styles.loadingText, { color: colors.textSecondary }]}>Thinking…</Text>
+            </View>
+          )}
+
+          {/* ── Input bar ── */}
+          <View style={[styles.inputBar, {
+            paddingBottom: Math.max(insets.bottom, 8),
+            marginBottom: Platform.OS === 'android' ? androidKeyboardOffset : 0,
+            backgroundColor: colors.inputWrapperBg,
+            borderTopColor: colors.inputBorder,
+          }]}>
+            <TextInput
+              style={[styles.input, { backgroundColor: colors.inputBg, color: colors.inputText }]}
+              placeholder="Ask AI about this document…"
+              placeholderTextColor={colors.inputPlaceholder}
+              value={inputText}
+              onChangeText={setInputText}
+              multiline
+              maxLength={MAX_DOCUMENT_QUESTION_LENGTH}
+              editable={!isAsking}
+              onSubmitEditing={handleSend}
+              blurOnSubmit={false}
+            />
+            <Pressable
+              onPress={handleSend}
+              disabled={!inputText.trim() || isAsking}
+              style={({ pressed }) => [
+                styles.sendBtn,
+                { backgroundColor: colors.primary },
+                (!inputText.trim() || isAsking) && { backgroundColor: colors.primaryLight, opacity: 0.7 },
+                pressed && styles.sendBtnPressed,
+              ]}
+            >
+              <Ionicons name="send" size={18} color="#fff" />
+            </Pressable>
+          </View>
+        </View>
+      </KeyboardAvoidingView>
+
+      <LanguagePickerModal
+        visible={isLanguagePickerOpen}
+        preferredLanguage={selectedLanguage}
+        onSelect={handleSelectLanguage}
+        onClose={() => setIsLanguagePickerOpen(false)}
+        colors={colors}
+      />
+    </Modal>
+  );
+}
+
+// ── Styles ───────────────────────────────────────────────────────────────────
+const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
+  // ── Header
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    gap: 10,
+  },
+  closeBtn: {
+    padding: 4,
+  },
+  headerTitleContainer: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  headerTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+    flex: 1,
+  },
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  languageBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 14,
+    gap: 4,
+  },
+  languageBtnText: {
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  pageIndicator: {
+    fontSize: 13,
+    fontWeight: '500',
+  },
+  // ── Document viewer (PDF / spreadsheet placeholder)
+  docViewer: {
+    height: PDF_PANEL_HEIGHT,
+  },
+  // ── Spreadsheet placeholder
+  spreadsheetPlaceholder: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+    gap: 8,
+  },
+  spreadsheetIcon: {
+    width: 64,
+    height: 64,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 4,
+  },
+  spreadsheetLabel: {
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  spreadsheetSublabel: {
+    fontSize: 13,
+  },
+  spreadsheetHint: {
+    fontSize: 12,
+    textAlign: 'center',
+    lineHeight: 18,
+    marginTop: 8,
+  },
+  spreadsheetLoading: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  // ── PDF
+  pdfContainer: {
+    height: PDF_PANEL_HEIGHT,
+  },
+  pdf: {
+    flex: 1,
+  },
+  pdfErrorContainer: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  pdfErrorText: {
+    fontSize: 14,
+  },
+  // ── Divider
+  divider: {
+    height: 3,
+  },
+  // ── Chat
+  chatContainer: {
+    flex: 1,
+  },
+  chatList: {
+    padding: 12,
+    gap: 8,
+  },
+  emptyChat: {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+    gap: 8,
+  },
+  emptyChatIcon: {
+    fontSize: 40,
+  },
+  emptyChatTitle: {
+    fontSize: 18,
+    fontWeight: '700',
+  },
+  emptyChatSubtitle: {
+    fontSize: 13,
+    textAlign: 'center',
+    lineHeight: 18,
+  },
+  // ── Q&A bubbles
+  qaBubble: {
+    maxWidth: '85%',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 16,
+    marginBottom: 4,
+  },
+  qaBubbleUser: {
+    alignSelf: 'flex-end',
+    borderBottomRightRadius: 4,
+  },
+  qaBubbleAi: {
+    alignSelf: 'flex-start',
+    borderBottomLeftRadius: 4,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  aiLabel: {
+    marginBottom: 4,
+  },
+  aiLabelText: {
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  qaText: {
+    fontSize: 14,
+    lineHeight: 20,
+  },
+  qaTextUser: {
+    color: '#fff',
+  },
+  qaTextAi: {
+  },
+  // ── Citations
+  citationsContainer: {
+    marginTop: 8,
+    gap: 4,
+  },
+  citationChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 8,
+    gap: 4,
+  },
+  citationChipPressed: {
+    opacity: 0.7,
+  },
+  citationPage: {
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  citationExcerpt: {
+    fontSize: 11,
+    flex: 1,
+  },
+  // ── Loading
+  loadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 8,
+    gap: 6,
+  },
+  loadingText: {
+    fontSize: 13,
+  },
+  // ── Input bar
+  inputBar: {
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    paddingHorizontal: 12,
+    paddingTop: 8,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    gap: 8,
+  },
+  input: {
+    flex: 1,
+    minHeight: 40,
+    maxHeight: 100,
+    borderRadius: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    fontSize: 14,
+  },
+  sendBtn: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sendBtnPressed: {
+    opacity: 0.8,
+  },
+});
